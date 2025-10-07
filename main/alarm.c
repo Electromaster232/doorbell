@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/dirent.h>
 #include <sys/stat.h>
 
 #include "freertos/FreeRTOS.h"
@@ -43,6 +44,9 @@
 
 // Filesystem
 #define MOUNT_POINT   "/sdcard"
+#define AUDIO_FOLDER MOUNT_POINT "/audio/"
+
+// Audio system
 #define AUDIO_BUFFER_MAX_SIZE (44100 * 16 * 30)           // buffer size for reading the wav file and sending to i2s. 44.1K 16-bit samples per second, times 30 seconds
 #define RB_CAPACITY     (96 * 1024)
 #define SD_READ_CHUNK   (8 * 1024)      // bytes per SD read  (multiple of 512)
@@ -51,6 +55,10 @@
 // Command queue
 #define BIT_PRODUCER_DONE  (1 << 0)
 #define BIT_CONSUMER_DONE  (1 << 1)
+
+typedef enum {COMMON, UNCOMMON, RARE, LEGENDARY, ANY} file_rarity_t;
+
+#define GET_ANY_RANDOM_FILENAME get_random_filename(file_rarity_t::ANY)
 
 static EventGroupHandle_t s_done_group;
 typedef enum { CMD_PLAY, CMD_STOP } player_cmd_t;
@@ -175,12 +183,12 @@ static esp_err_t prepare_wav_file(decoded_wav_t* wav_s, const char *filename) {
         return ESP_FAIL;
     }
     // Put the file names together
-    char* full_file_name = malloc(strlen(filename) + strlen(MOUNT_POINT) + 2);
-    strcpy(full_file_name, MOUNT_POINT);
-    strcat(full_file_name, "/");
-    strcat(full_file_name, filename);
-    FILE *fh = fopen(full_file_name, "rb");
-    free(full_file_name);
+    // char* full_file_name = malloc(strlen(filename) + strlen(MOUNT_POINT) + 2);
+    // strcpy(full_file_name, MOUNT_POINT);
+    // strcat(full_file_name, "/");
+    // strcat(full_file_name, filename);
+    FILE *fh = fopen(filename, "rb");
+    // free(full_file_name);
     if (fh == NULL)
     {
         ESP_LOGE(TAG, "Failed to open file");
@@ -231,6 +239,89 @@ static esp_err_t prepare_wav_file(decoded_wav_t* wav_s, const char *filename) {
     ESP_LOGI(TAG, "Number of samples: %d", wav_s->s_number_of_samples);
     return ESP_OK;
 }
+
+int randrange(int min, int max){
+    return min + rand() / (RAND_MAX / (max - min + 1) + 1);
+}
+
+static char* name_from_rarity(file_rarity_t rarity) {
+    switch (rarity) {
+        case ANY: return "ANY"; break;
+        case COMMON: return "COMMON"; break;
+        case UNCOMMON: return "UNCOMMON"; break;
+        case RARE: return "RARE"; break;
+        case LEGENDARY: return "LEGENDARY"; break;
+    }
+    return NULL;
+}
+
+static int count_files_in_directory(const char *path) {
+    DIR *dir_ptr;
+    struct dirent *direntp;
+    int file_count = 0;
+
+    // Open the directory
+    if ((dir_ptr = opendir(path)) == NULL) {
+        perror("Failed to open directory");
+        return -1; // Indicate an error
+    }
+
+    // Read directory entries
+    while ((direntp = readdir(dir_ptr)) != NULL) {
+        // Skip "." and ".." entries
+        if (strcmp(direntp->d_name, ".") == 0 || strcmp(direntp->d_name, "..") == 0) {
+            continue;
+        }
+
+        // Check if the entry is a regular file
+        // d_type is not universally supported, consider using stat() for robustness
+        if (direntp->d_type == DT_REG) {
+            file_count++;
+        }
+    }
+
+    // Close the directory
+    closedir(dir_ptr);
+    return file_count;
+}
+
+int numPlaces (int n) {
+    if (n < 0) return numPlaces ((n == INT_MIN) ? INT_MAX: -n);
+    if (n < 10) return 1;
+    return 1 + numPlaces (n / 10);
+}
+
+
+
+
+static char* get_random_filename(file_rarity_t rarity) {
+    const static char* TAG = "get_random_filename";
+    // First decide which folder type we want
+    // If any, roll random between 0-3
+    if (rarity == ANY) {
+        rarity = randrange(0,3);
+    }
+    ESP_LOGI(TAG, "Rarity: %d", rarity);
+    // Get foldername
+    char* rarityName = name_from_rarity(rarity);
+    char* foldername = malloc(strlen(rarityName) + strlen(AUDIO_FOLDER) + 2);
+    strcpy(foldername, AUDIO_FOLDER);
+    strcat(foldername, rarityName);
+
+
+    uint8_t fileNum = count_files_in_directory(foldername);
+
+    int selectedFileNum = randrange(0, fileNum);
+    char* fileName = malloc(strlen(foldername) + numPlaces(selectedFileNum) + 5);
+    strcpy(fileName, foldername);
+    strcat(fileName, "/");
+    strcat(fileName, (const char*) ('0' + selectedFileNum));
+    strcat(fileName, ".wav");
+    ESP_LOGI(TAG, "File name: %s", fileName);
+    free(foldername);
+    return fileName;
+}
+
 
 // ---------------- WAV playback (task context) ----------------
 static void consumer_i2s_task(void* arg) {
@@ -328,13 +419,17 @@ static void trigger_gpio_init(void)
 // ---------------- Player task ----------------
 static void player_task(void *arg)
 {
+    char* filename = NULL;
     const static char* TAG = "player_task";
     if (sdcard_mount() != ESP_OK) {
         ESP_LOGE(TAG, "SD mount failed, player task exiting.");
         vTaskDelete(NULL);
         return;
     }
-    prepare_wav_file(&s_decoded_wavs[0], "MYMUSIC.wav");
+    filename = get_random_filename(ANY);
+    prepare_wav_file(&s_decoded_wavs[0], filename);
+    free(filename);
+    filename = NULL;
     if (!s_done_group) s_done_group = xEventGroupCreate();
 
     for (;;) {
@@ -356,7 +451,10 @@ static void player_task(void *arg)
                     );
                     // If we queued more than one play, reset now
                     xQueueReset(s_cmd_q);
-                    prepare_wav_file(&s_decoded_wavs[0], "MYMUSIC.wav");
+                    filename = get_random_filename(ANY);
+                    prepare_wav_file(&s_decoded_wavs[0], filename);
+                    free(filename);
+                    filename = NULL;
                 }
             }
         }

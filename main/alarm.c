@@ -4,6 +4,9 @@
  * 2025
  */
 
+#include <bootloader_random.h>
+#include <esp_heap_trace.h>
+#include <esp_random.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/dirent.h>
@@ -176,7 +179,7 @@ static esp_err_t prepare_wav_file(decoded_wav_t* wav_s, const char *filename) {
     const static char* TAG = "prepare_wav_file";
     ESP_LOGI(TAG, "Preparing wav file %s", filename);
     // Setup the stream buffer
-    if (wav_s->s_reader_buffer) vStreamBufferDelete(wav_s->s_reader_buffer);
+    if (wav_s->s_reader_buffer != NULL) vStreamBufferDelete(wav_s->s_reader_buffer);
     wav_s->s_reader_buffer = xStreamBufferCreate(RB_CAPACITY, 0);
     if (wav_s->s_reader_buffer == NULL) {
         ESP_LOGE(TAG, "Failed to create reader buffer");
@@ -218,20 +221,21 @@ static esp_err_t prepare_wav_file(decoded_wav_t* wav_s, const char *filename) {
     fseek(fh, 44, SEEK_SET);
 
     // Begin prefilling the buffer
-    {
-        uint8_t* pre = heap_caps_malloc(SD_READ_CHUNK, MALLOC_CAP_DMA);
-        wav_s->s_reader_offset = 0;
-        while (wav_s->s_reader_offset < (RB_CAPACITY)) {
-            size_t n = fread(pre, 1, SD_READ_CHUNK, fh);
-            if (n == 0) break;
-            size_t sent = 0;
-            while (sent < n) {
-                sent += xStreamBufferSend(wav_s->s_reader_buffer, pre + sent, n - sent, portMAX_DELAY);
-            }
-            wav_s->s_reader_offset += n;
+
+    uint8_t* pre = heap_caps_malloc(SD_READ_CHUNK, MALLOC_CAP_DMA);
+    wav_s->s_reader_offset = 0;
+    while (wav_s->s_reader_offset < (RB_CAPACITY)) {
+        const size_t n = fread(pre, 1, SD_READ_CHUNK, fh);
+        heap_caps_check_integrity_all(1);
+        if (n == 0) break;
+        size_t sent = 0;
+        while (sent < n) {
+            sent += xStreamBufferSend(wav_s->s_reader_buffer, pre + sent, n - sent, portMAX_DELAY);
         }
-        vPortFree(pre);
+        wav_s->s_reader_offset += n;
     }
+    heap_caps_free(pre);
+
 
     ESP_LOGI(TAG, "WAV file loaded. Leaving the following struct behind:");
     ESP_LOGI(TAG, "Sample rate: %d", wav_s->s_buffer_sample_rate);
@@ -256,9 +260,11 @@ static char* name_from_rarity(file_rarity_t rarity) {
 }
 
 static int count_files_in_directory(const char *path) {
+    const static char* TAG = "count_files_in_directory";
     DIR *dir_ptr;
     struct dirent *direntp;
     int file_count = 0;
+    ESP_LOGI(TAG, "Path: %s", path);
 
     // Open the directory
     if ((dir_ptr = opendir(path)) == NULL) {
@@ -269,12 +275,11 @@ static int count_files_in_directory(const char *path) {
     // Read directory entries
     while ((direntp = readdir(dir_ptr)) != NULL) {
         // Skip "." and ".." entries
-        if (strcmp(direntp->d_name, ".") == 0 || strcmp(direntp->d_name, "..") == 0) {
+        if (strcmp(direntp->d_name, ".") == 0 || strcmp(direntp->d_name, "..") == 0 || strncmp(direntp->d_name, ".", 1) == 0) {
             continue;
         }
 
-        // Check if the entry is a regular file
-        // d_type is not universally supported, consider using stat() for robustness
+        //Check if the entry is a regular file
         if (direntp->d_type == DT_REG) {
             file_count++;
         }
@@ -286,11 +291,14 @@ static int count_files_in_directory(const char *path) {
 }
 
 int numPlaces (int n) {
-    if (n < 0) return numPlaces ((n == INT_MIN) ? INT_MAX: -n);
-    if (n < 10) return 1;
-    return 1 + numPlaces (n / 10);
+    int r = 1;
+    if (n < 0) n = (n == INT_MIN) ? INT_MAX: -n;
+    while (n > 9) {
+        n /= 10;
+        r++;
+    }
+    return r;
 }
-
 
 
 
@@ -311,12 +319,13 @@ static char* get_random_filename(file_rarity_t rarity) {
 
     uint8_t fileNum = count_files_in_directory(foldername);
 
-    int selectedFileNum = randrange(0, fileNum);
-    char* fileName = malloc(strlen(foldername) + numPlaces(selectedFileNum) + 5);
-    strcpy(fileName, foldername);
-    strcat(fileName, "/");
-    strcat(fileName, (const char*) ('0' + selectedFileNum));
-    strcat(fileName, ".wav");
+    int selectedFileNum = randrange(0, fileNum-1);
+    unsigned int decPlacesInFileNum = numPlaces(selectedFileNum);
+    ESP_LOGI(TAG, "Places in file: %d", decPlacesInFileNum);
+    size_t fileNameLen = strlen(foldername) + decPlacesInFileNum + 6;
+    ESP_LOGI(TAG, "File name len: %d", fileNameLen);
+    char* fileName = malloc(fileNameLen);
+    sprintf(fileName, "%s/%d.wav", foldername, selectedFileNum);
     ESP_LOGI(TAG, "File name: %s", fileName);
     free(foldername);
     return fileName;
@@ -327,11 +336,11 @@ static char* get_random_filename(file_rarity_t rarity) {
 static void consumer_i2s_task(void* arg) {
     const static char* TAG = "consumer_i2s_task";
     decoded_wav_t* wav_s = (decoded_wav_t*)arg;
-    uint8_t* chunk = heap_caps_malloc(I2S_WRITE_CHUNK, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    i2s_init(wav_s->s_buffer_sample_rate, 1);
+    uint8_t* chunk = heap_caps_malloc(I2S_WRITE_CHUNK, MALLOC_CAP_DMA);
+    i2s_update_rate_channels(wav_s->s_buffer_sample_rate, 1);
     for (;;) {
         // Wait until at least one byte is available, then read up to chunk size
-        size_t got = xStreamBufferReceive(wav_s->s_reader_buffer, chunk, I2S_WRITE_CHUNK, pdMS_TO_TICKS(2000));
+        size_t got = xStreamBufferReceive(wav_s->s_reader_buffer, chunk, I2S_WRITE_CHUNK, pdMS_TO_TICKS(1000));
         if (got < I2S_WRITE_CHUNK) {
             ESP_LOGW(TAG, "Received %d bytes, less than chunk size!!", got);
         }
@@ -351,9 +360,10 @@ static void consumer_i2s_task(void* arg) {
             }
         }
     }
-    vPortFree(chunk);
-    i2s_driver_uninstall(I2S_NUM_0);
+    heap_caps_free(chunk);
     xEventGroupSetBits(s_done_group, BIT_CONSUMER_DONE);
+    vStreamBufferDelete(wav_s->s_reader_buffer);
+    wav_s->s_reader_buffer = NULL;
     vTaskDelete(NULL);
 }
 
@@ -374,8 +384,9 @@ static void producer_task(void* arg) {
         }
     }
     // Signal EOF by closing the stream (writer will detect no more incoming after drain)
-    vPortFree(tmp);
+    heap_caps_free(tmp);
     fclose(wav_s->s_file_handle);
+    wav_s->s_file_handle = NULL;
     xEventGroupSetBits(s_done_group, BIT_PRODUCER_DONE);
     ESP_LOGI(TAG, "Producer done reading file");
     vTaskDelete(NULL);
@@ -428,11 +439,12 @@ static void player_task(void *arg)
     }
     filename = get_random_filename(ANY);
     prepare_wav_file(&s_decoded_wavs[0], filename);
+    i2s_init(s_decoded_wavs[0].s_buffer_sample_rate, 1);
     free(filename);
     filename = NULL;
     if (!s_done_group) s_done_group = xEventGroupCreate();
 
-    for (;;) {
+    while (1) {
         player_cmd_t cmd;
         if (xQueueReceive(s_cmd_q, &cmd, portMAX_DELAY) == pdTRUE) {
             if (cmd == CMD_PLAY) {
@@ -470,9 +482,10 @@ void app_main(void)
 
     s_cmd_q = xQueueCreate(4, sizeof(player_cmd_t));
     configASSERT(s_cmd_q != NULL);
-
+    bootloader_random_enable();
+    srand(esp_random());
+    bootloader_random_disable();
     trigger_gpio_init();
-
 
 
     xTaskCreatePinnedToCore(player_task, "player_task",

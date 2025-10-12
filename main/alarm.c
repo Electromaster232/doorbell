@@ -28,56 +28,10 @@
 #include "freertos/stream_buffer.h"
 
 
-// --- Pins ---
-// SD over SPI (SDSPI on SPI2/HSPI)
-#define SD_CS          5
-#define SPI_MOSI      23
-#define SPI_MISO      19
-#define SPI_SCK       18
-
-// I2S
-#define I2S_DOUT      27
-#define I2S_BCLK      26
-#define I2S_LRC       25
-
-// Trigger input
-#define TRIGGER_GPIO   GPIO_NUM_4
-#define TRIGGER_LEVEL  0             // 0: falling edge, 1: rising edge
-#define DEBOUNCE_MS    50
-
-// Filesystem
-#define MOUNT_POINT   "/sdcard"
-#define AUDIO_FOLDER MOUNT_POINT "/audio/"
-
-// Audio system
-#define AUDIO_BUFFER_MAX_SIZE (44100 * 16 * 30)           // buffer size for reading the wav file and sending to i2s. 44.1K 16-bit samples per second, times 30 seconds
-#define RB_CAPACITY     (96 * 1024)
-#define SD_READ_CHUNK   (8 * 1024)      // bytes per SD read  (multiple of 512)
-#define I2S_WRITE_CHUNK (4 * 1024)      // bytes per I2S write
-
-// Command queue
-#define BIT_PRODUCER_DONE  (1 << 0)
-#define BIT_CONSUMER_DONE  (1 << 1)
-
-typedef enum {COMMON, UNCOMMON, RARE, LEGENDARY, ANY} file_rarity_t;
-
-#define GET_ANY_RANDOM_FILENAME get_random_filename(file_rarity_t::ANY)
-
-static EventGroupHandle_t s_done_group;
-typedef enum { CMD_PLAY, CMD_STOP } player_cmd_t;
-static QueueHandle_t s_cmd_q = NULL;
-static volatile bool s_is_playing = false;
+#include "alarm.h"
+#include "filesystem.c"
 
 
-typedef struct {
-    size_t s_buffer_size;
-    size_t s_number_of_samples;
-    int s_buffer_sample_rate;
-    FILE* s_file_handle;
-    size_t s_reader_offset;
-    StreamBufferHandle_t s_reader_buffer;
-    bool s_paused;
-} decoded_wav_t;
 
 static decoded_wav_t s_decoded_wavs[2];
 
@@ -175,80 +129,12 @@ static esp_err_t sdcard_mount(void)
 //     spi_bus_free(SPI2_HOST);
 // }
 
-static esp_err_t prepare_wav_file(decoded_wav_t* wav_s, const char *filename) {
-    const static char* TAG = "prepare_wav_file";
-    ESP_LOGI(TAG, "Preparing wav file %s", filename);
-    // Setup the stream buffer
-    if (wav_s->s_reader_buffer != NULL) vStreamBufferDelete(wav_s->s_reader_buffer);
-    wav_s->s_reader_buffer = xStreamBufferCreate(RB_CAPACITY, 0);
-    if (wav_s->s_reader_buffer == NULL) {
-        ESP_LOGE(TAG, "Failed to create reader buffer");
-        return ESP_FAIL;
-    }
-    // Put the file names together
-    // char* full_file_name = malloc(strlen(filename) + strlen(MOUNT_POINT) + 2);
-    // strcpy(full_file_name, MOUNT_POINT);
-    // strcat(full_file_name, "/");
-    // strcat(full_file_name, filename);
-    FILE *fh = fopen(filename, "rb");
-    // free(full_file_name);
-    if (fh == NULL)
-    {
-        ESP_LOGE(TAG, "Failed to open file");
-        return ESP_ERR_INVALID_ARG;
-    }
-    wav_s->s_file_handle = fh;
-    // Seek to sample rate
-    fseek(fh, 24, SEEK_SET);
-    // Read sample rate
-    fread(&(wav_s->s_buffer_sample_rate), 4, 1, fh);
-    ESP_LOGI(TAG, "sample rate: %d", wav_s->s_buffer_sample_rate);
-    // Seek to Subchunk2Size
-    fseek(fh, 40, SEEK_SET);
-    // Read subchunk (audio data) size
-    size_t data_byte_size;
-    fread(&data_byte_size, 4, 1, fh);
-    // This is NOT the number of samples
-    // This is the number of bytes of the entire data area!!
-    // == NumSamples * NumChannels * BitsPerSample/8
-    // Since we know NumChannels and BitsPerSample, it is possible to calculate NumSamples
-
-    wav_s->s_number_of_samples = data_byte_size / 1 / (16/8);
-    wav_s->s_buffer_size = data_byte_size;
-    ESP_LOGI(TAG, "buffer size: %d", wav_s->s_buffer_size);
-
-    // Seek to data
-    fseek(fh, 44, SEEK_SET);
-
-    // Begin prefilling the buffer
-
-    uint8_t* pre = heap_caps_malloc(SD_READ_CHUNK, MALLOC_CAP_DMA);
-    wav_s->s_reader_offset = 0;
-    while (wav_s->s_reader_offset < (RB_CAPACITY)) {
-        const size_t n = fread(pre, 1, SD_READ_CHUNK, fh);
-        heap_caps_check_integrity_all(1);
-        if (n == 0) break;
-        size_t sent = 0;
-        while (sent < n) {
-            sent += xStreamBufferSend(wav_s->s_reader_buffer, pre + sent, n - sent, portMAX_DELAY);
-        }
-        wav_s->s_reader_offset += n;
-    }
-    heap_caps_free(pre);
-
-
-    ESP_LOGI(TAG, "WAV file loaded. Leaving the following struct behind:");
-    ESP_LOGI(TAG, "Sample rate: %d", wav_s->s_buffer_sample_rate);
-    ESP_LOGI(TAG, "Buffer size: %d", wav_s->s_buffer_size);
-    ESP_LOGI(TAG, "Number of samples: %d", wav_s->s_number_of_samples);
-    return ESP_OK;
-}
 
 int randrange(int min, int max){
     return min + rand() / (RAND_MAX / (max - min + 1) + 1);
 }
 
-static char* name_from_rarity(file_rarity_t rarity) {
+char* name_from_rarity(file_rarity_t rarity) {
     switch (rarity) {
         case ANY: return "ANY"; break;
         case COMMON: return "COMMON"; break;
@@ -259,77 +145,6 @@ static char* name_from_rarity(file_rarity_t rarity) {
     return NULL;
 }
 
-static int count_files_in_directory(const char *path) {
-    const static char* TAG = "count_files_in_directory";
-    DIR *dir_ptr;
-    struct dirent *direntp;
-    int file_count = 0;
-    ESP_LOGI(TAG, "Path: %s", path);
-
-    // Open the directory
-    if ((dir_ptr = opendir(path)) == NULL) {
-        perror("Failed to open directory");
-        return -1; // Indicate an error
-    }
-
-    // Read directory entries
-    while ((direntp = readdir(dir_ptr)) != NULL) {
-        // Skip "." and ".." entries
-        if (strcmp(direntp->d_name, ".") == 0 || strcmp(direntp->d_name, "..") == 0 || strncmp(direntp->d_name, ".", 1) == 0) {
-            continue;
-        }
-
-        //Check if the entry is a regular file
-        if (direntp->d_type == DT_REG) {
-            file_count++;
-        }
-    }
-
-    // Close the directory
-    closedir(dir_ptr);
-    return file_count;
-}
-
-int numPlaces (int n) {
-    int r = 1;
-    if (n < 0) n = (n == INT_MIN) ? INT_MAX: -n;
-    while (n > 9) {
-        n /= 10;
-        r++;
-    }
-    return r;
-}
-
-
-
-static char* get_random_filename(file_rarity_t rarity) {
-    const static char* TAG = "get_random_filename";
-    // First decide which folder type we want
-    // If any, roll random between 0-3
-    if (rarity == ANY) {
-        rarity = randrange(0,3);
-    }
-    ESP_LOGI(TAG, "Rarity: %d", rarity);
-    // Get foldername
-    char* rarityName = name_from_rarity(rarity);
-    char* foldername = malloc(strlen(rarityName) + strlen(AUDIO_FOLDER) + 2);
-    strcpy(foldername, AUDIO_FOLDER);
-    strcat(foldername, rarityName);
-
-
-    uint8_t fileNum = count_files_in_directory(foldername);
-
-    int selectedFileNum = randrange(0, fileNum-1);
-    unsigned int decPlacesInFileNum = numPlaces(selectedFileNum);
-    ESP_LOGI(TAG, "Places in file: %d", decPlacesInFileNum);
-    size_t fileNameLen = strlen(foldername) + decPlacesInFileNum + 6;
-    ESP_LOGI(TAG, "File name len: %d", fileNameLen);
-    char* fileName = malloc(fileNameLen);
-    sprintf(fileName, "%s/%d.wav", foldername, selectedFileNum);
-    ESP_LOGI(TAG, "File name: %s", fileName);
-    free(foldername);
-    return fileName;
-}
 
 
 // ---------------- WAV playback (task context) ----------------

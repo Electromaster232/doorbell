@@ -293,10 +293,57 @@ static void player_task(void *arg)
 
 }
 
+static void IRAM_ATTR isr_boot(void *arg) {
+    uint32_t v = 1;
+    BaseType_t hpw = pdFALSE;
+    if (!s_pair_window_open)
+        xQueueSendFromISR(s_btnq, &v, &hpw);
+    portYIELD_FROM_ISR();
+}
+
+static void button_task(void *arg) {
+    uint32_t v;
+    for (;;) {
+        if (xQueueReceive(s_btnq, &v, portMAX_DELAY)) {
+            // simple debounce (optional)
+            vTaskDelay(pdMS_TO_TICKS(50));
+            if (gpio_get_level(BOOT_BTN_GPIO) == 0) {
+                open_pair_window();
+            }
+        }
+    }
+}
+
+static void button_init(void) {
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << BOOT_BTN_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,   // BOOT has on-board pull-up
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE      // press -> low
+    };
+    gpio_config(&io);
+    gpio_isr_handler_add(BOOT_BTN_GPIO, isr_boot, NULL);
+
+    s_btnq = xQueueCreate(4, sizeof(uint32_t));
+    xTaskCreatePinnedToCore(button_task, "btn", 8192, NULL, 5, NULL, tskNO_AFFINITY);
+
+    // Timer for closing the window
+    const esp_timer_create_args_t targs = { .callback = &close_pair_window, .name = "pairwin" };
+    esp_timer_create(&targs, &s_pair_timer);
+}
+
 // ---------------- app_main ----------------
 void app_main(void)
 {
-    ESP_ERROR_CHECK(nvs_flash_init());
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        // NVS partition was truncated and needs to be erased
+        // Retry nvs_flash_init
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
 
     s_cmd_q = xQueueCreate(4, sizeof(player_cmd_t));
     configASSERT(s_cmd_q != NULL);
@@ -307,6 +354,8 @@ void app_main(void)
 
     /* Initialize the controller + HCI and the NimBLE host */
     nimble_port_init();
+    ble_security_init();
+    button_init();
 
     /* Register GAP/GATT services provided by NimBLE (for Device Name, etc.) */
     ble_svc_gap_init();

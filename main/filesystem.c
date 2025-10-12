@@ -91,13 +91,9 @@ esp_err_t prepare_wav_file(decoded_wav_t* wav_s, const char *filename) {
         ESP_LOGE(TAG, "Failed to create reader buffer");
         return ESP_FAIL;
     }
-    // Put the file names together
-    // char* full_file_name = malloc(strlen(filename) + strlen(MOUNT_POINT) + 2);
-    // strcpy(full_file_name, MOUNT_POINT);
-    // strcat(full_file_name, "/");
-    // strcat(full_file_name, filename);
+
     FILE *fh = fopen(filename, "rb");
-    // free(full_file_name);
+
     if (fh == NULL)
     {
         ESP_LOGE(TAG, "Failed to open file");

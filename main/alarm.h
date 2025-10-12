@@ -4,6 +4,28 @@
 
 #ifndef ALARM_ALARM_H
 #define ALARM_ALARM_H
+#include <bootloader_random.h>
+#include <esp_heap_trace.h>
+#include <esp_random.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+
+#include "driver/gpio.h"
+#include "driver/i2s.h"
+#include "driver/spi_master.h"
+#include "driver/sdspi_host.h"
+#include "sdmmc_cmd.h"
+#include "esp_vfs_fat.h"
+#include "esp_check.h"
+#include "freertos/stream_buffer.h"
+
 
 // --- Pins ---
 // SD over SPI (SDSPI on SPI2/HSPI)
@@ -28,7 +50,7 @@
 
 // Audio system
 #define AUDIO_BUFFER_MAX_SIZE (44100 * 16 * 30)           // buffer size for reading the wav file and sending to i2s. 44.1K 16-bit samples per second, times 30 seconds
-#define RB_CAPACITY     (96 * 1024)
+#define RB_CAPACITY     (48 * 1024)
 #define SD_READ_CHUNK   (8 * 1024)      // bytes per SD read  (multiple of 512)
 #define I2S_WRITE_CHUNK (4 * 1024)      // bytes per I2S write
 
@@ -41,7 +63,7 @@ typedef enum {COMMON, UNCOMMON, RARE, LEGENDARY, ANY} file_rarity_t;
 #define GET_ANY_RANDOM_FILENAME get_random_filename(file_rarity_t::ANY)
 
 static EventGroupHandle_t s_done_group;
-typedef enum { CMD_PLAY, CMD_STOP } player_cmd_t;
+typedef enum { CMD_PLAY, CMD_STOP, CMD_PLAY_DOORBELL } player_cmd_t;
 static QueueHandle_t s_cmd_q = NULL;
 static volatile bool s_is_playing = false;
 

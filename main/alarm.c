@@ -4,34 +4,18 @@
  * 2025
  */
 
-#include <bootloader_random.h>
-#include <esp_heap_trace.h>
-#include <esp_random.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/dirent.h>
-#include <sys/stat.h>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
-#include "esp_log.h"
-#include "nvs_flash.h"
-
-#include "driver/gpio.h"
-#include "driver/i2s.h"
-#include "driver/spi_master.h"
-#include "driver/sdspi_host.h"
-#include "sdmmc_cmd.h"
-#include "esp_vfs_fat.h"
-#include "esp_check.h"
-#include "freertos/stream_buffer.h"
 
 
 #include "alarm.h"
 #include "filesystem.c"
+#include "bluetooth.c"
 
 
+typedef struct {
+    decoded_wav_t* wav;
+    bool destroy_on_finish;
+} playback_cmd_t;
 
 static decoded_wav_t s_decoded_wavs[2];
 
@@ -150,7 +134,8 @@ char* name_from_rarity(file_rarity_t rarity) {
 // ---------------- WAV playback (task context) ----------------
 static void consumer_i2s_task(void* arg) {
     const static char* TAG = "consumer_i2s_task";
-    decoded_wav_t* wav_s = (decoded_wav_t*)arg;
+    playback_cmd_t* cmd = (playback_cmd_t*)arg;
+    decoded_wav_t* wav_s = cmd->wav;
     uint8_t* chunk = heap_caps_malloc(I2S_WRITE_CHUNK, MALLOC_CAP_DMA);
     i2s_update_rate_channels(wav_s->s_buffer_sample_rate, 1);
     for (;;) {
@@ -177,14 +162,13 @@ static void consumer_i2s_task(void* arg) {
     }
     heap_caps_free(chunk);
     xEventGroupSetBits(s_done_group, BIT_CONSUMER_DONE);
-    vStreamBufferDelete(wav_s->s_reader_buffer);
-    wav_s->s_reader_buffer = NULL;
     vTaskDelete(NULL);
 }
 
 static void producer_task(void* arg) {
     const static char* TAG = "producer_task";
-    decoded_wav_t* wav_s = (decoded_wav_t*)arg;
+    const playback_cmd_t* cmd = (playback_cmd_t*)arg;
+    decoded_wav_t* wav_s = cmd->wav;
     uint8_t* tmp = heap_caps_malloc(SD_READ_CHUNK, MALLOC_CAP_DMA);
     size_t got = 0;
     for (;;) {
@@ -200,8 +184,15 @@ static void producer_task(void* arg) {
     }
     // Signal EOF by closing the stream (writer will detect no more incoming after drain)
     heap_caps_free(tmp);
-    fclose(wav_s->s_file_handle);
-    wav_s->s_file_handle = NULL;
+    if (cmd->destroy_on_finish) {
+        fclose(wav_s->s_file_handle);
+        wav_s->s_file_handle = NULL;
+    }
+    else {
+        // Reset the file to the beginning of PCM data for the next play instead
+        fseek(wav_s->s_file_handle, 44, SEEK_SET);
+        wav_s->s_reader_offset = 0;
+    }
     xEventGroupSetBits(s_done_group, BIT_PRODUCER_DONE);
     ESP_LOGI(TAG, "Producer done reading file");
     vTaskDelete(NULL);
@@ -252,21 +243,30 @@ static void player_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
+
+    // Prepare first file
     filename = get_random_filename(ANY);
     prepare_wav_file(&s_decoded_wavs[0], filename);
     i2s_init(s_decoded_wavs[0].s_buffer_sample_rate, 1);
     free(filename);
     filename = NULL;
+
+    // Prepare BLE file
+    prepare_wav_file(&s_decoded_wavs[1], AUDIO_FOLDER "doorbell.wav");
     if (!s_done_group) s_done_group = xEventGroupCreate();
 
     while (1) {
         player_cmd_t cmd;
         if (xQueueReceive(s_cmd_q, &cmd, portMAX_DELAY) == pdTRUE) {
-            if (cmd == CMD_PLAY) {
+            if (cmd == CMD_PLAY || cmd == CMD_PLAY_DOORBELL) {
+                playback_cmd_t pcmd;
                 ESP_LOGI(TAG, "PLAY command received");
                 if (!s_is_playing) {
-                    xTaskCreatePinnedToCore(producer_task, "sd_reader", 4096, &s_decoded_wavs[0], 5, NULL, 1);
-                    xTaskCreatePinnedToCore(consumer_i2s_task, "i2s_writer", 4096, &s_decoded_wavs[0], 6, NULL, 1);
+                    decoded_wav_t* wav = cmd == CMD_PLAY ? &s_decoded_wavs[0] : &s_decoded_wavs[1];
+                    pcmd.wav = wav;
+                    pcmd.destroy_on_finish = cmd == CMD_PLAY;
+                    xTaskCreatePinnedToCore(producer_task, "sd_reader", 4096, &pcmd, 5, NULL, 1);
+                    xTaskCreatePinnedToCore(consumer_i2s_task, "i2s_writer", 4096, &pcmd, 6, NULL, 1);
 
                     // Wait until BOTH bits are set
                     (void)xEventGroupWaitBits(
@@ -278,10 +278,13 @@ static void player_task(void *arg)
                     );
                     // If we queued more than one play, reset now
                     xQueueReset(s_cmd_q);
-                    filename = get_random_filename(ANY);
-                    prepare_wav_file(&s_decoded_wavs[0], filename);
-                    free(filename);
-                    filename = NULL;
+                    if (cmd == CMD_PLAY) {
+                        filename = get_random_filename(ANY);
+                        prepare_wav_file(&s_decoded_wavs[0], filename);
+                        free(filename);
+                        filename = NULL;
+                    }
+                    else{ xStreamBufferReset(wav->s_reader_buffer); }
                 }
             }
         }
@@ -301,6 +304,30 @@ void app_main(void)
     srand(esp_random());
     bootloader_random_disable();
     trigger_gpio_init();
+
+    /* Initialize the controller + HCI and the NimBLE host */
+    nimble_port_init();
+
+    /* Register GAP/GATT services provided by NimBLE (for Device Name, etc.) */
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+
+    /* Set the device name that appears in scan results */
+    ble_svc_gap_device_name_set(DEVICE_NAME);
+
+    /* Add our own GATT services */
+    int rc = ble_gatts_count_cfg(gatt_svcs);
+    assert(rc == 0);
+    rc = ble_gatts_add_svcs(gatt_svcs);
+    assert(rc == 0);
+
+    /* Start the host; once sync completes, start advertising */
+    ble_hs_cfg.reset_cb = NULL;          /* optional */
+    ble_hs_cfg.sync_cb  = on_sync;       /* called when the stack is ready */
+    ble_hs_cfg.gatts_register_cb = NULL; /* optional debug */
+
+    /* Launch host thread */
+    nimble_port_freertos_init(host_task);
 
 
     xTaskCreatePinnedToCore(player_task, "player_task",

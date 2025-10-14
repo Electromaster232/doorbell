@@ -4,13 +4,11 @@
  * 2025
  */
 
-
-
-
 #include "alarm.h"
 #include "filesystem.c"
 #include "bluetooth.c"
-
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 
 typedef struct {
     decoded_wav_t* wav;

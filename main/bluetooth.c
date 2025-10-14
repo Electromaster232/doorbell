@@ -5,9 +5,6 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
-#include "host/util/util.h"
-#include "services/gap/ble_svc_gap.h"
-#include "services/gatt/ble_svc_gatt.h"
 #include <stdint.h>
 #include "alarm.h"
 

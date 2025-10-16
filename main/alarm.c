@@ -113,7 +113,7 @@ static esp_err_t sdcard_mount(void)
 
 
 int randrange(int min, int max){
-    return min + esp_random() / (RAND_MAX / (max - min + 1) + 1);
+    return min + esp_random() / (UINT32_MAX / (max - min + 1) + 1);
 }
 
 char* name_from_rarity(file_rarity_t rarity) {
@@ -277,9 +277,14 @@ static void player_task(void *arg)
                     // If we queued more than one play, reset now
                     xQueueReset(s_cmd_q);
                     if (cmd == CMD_PLAY) {
-                        filename = get_random_filename(ANY);
-                        prepare_wav_file(&s_decoded_wavs[0], filename);
-                        free(filename);
+                        esp_err_t err;
+                        do {
+                            filename = get_random_filename(ANY);
+                            err = prepare_wav_file(&s_decoded_wavs[0], filename);
+                            free(filename);
+                        }
+                        while (err != ESP_OK);
+
                         filename = NULL;
                     }
                     else{ xStreamBufferReset(wav->s_reader_buffer); }

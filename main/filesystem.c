@@ -25,7 +25,7 @@ int count_files_in_directory(const char *path) {
     // Read directory entries
     while ((direntp = readdir(dir_ptr)) != NULL) {
         // Skip "." and ".." entries
-        if (strcmp(direntp->d_name, ".") == 0 || strcmp(direntp->d_name, "..") == 0 || strncmp(direntp->d_name, ".", 1) == 0) {
+        if (strncmp(direntp->d_name, ".", 1) == 0) {
             continue;
         }
 
@@ -55,40 +55,39 @@ int numPlaces (int n) {
 #define WEIGHT_UNCOMMON   25
 #define WEIGHT_RARE       12
 #define WEIGHT_LEGENDARY   3
+#define NUM_WEIGHTS        4
 
 static file_rarity_t pick_weighted_rarity(void) {
-    const int weights[] = {
+
+
+    const int weights[NUM_WEIGHTS] = {
         WEIGHT_COMMON,
         WEIGHT_UNCOMMON,
         WEIGHT_RARE,
         WEIGHT_LEGENDARY
     };
-    const file_rarity_t rarities[] = {
+    const file_rarity_t rarities[NUM_WEIGHTS] = {
         COMMON, UNCOMMON, RARE, LEGENDARY
     };
 
     int total = 0;
-    for (size_t i = 0; i < sizeof(weights)/sizeof(weights[0]); ++i) {
+    for (size_t i = 0; i < NUM_WEIGHTS; ++i) {
         if (weights[i] > 0) total += weights[i];
     }
 
-    // Defensive: if all weights are zero, fall back to COMMON
     if (total <= 0) return COMMON;
 
-    // Get a number in [0, total-1] using esp_random (uniform over uint32)
-    uint32_t r = esp_random() % (uint32_t)total;
+    const int r = randrange(0, total);
 
-    // Walk cumulative weights
     int total_weight = 0;
-    for (size_t i = 0; i < sizeof(weights)/sizeof(weights[0]); ++i) {
+    for (size_t i = 0; i < NUM_WEIGHTS; ++i) {
         if (weights[i] <= 0) continue; // skip zero/negative weights
         total_weight += weights[i];
-        if ((int)r < total_weight) {
+        if (r <= total_weight) {
             return rarities[i];
         }
     }
 
-    // Fallback
     return COMMON;
 }
 

@@ -4,69 +4,16 @@
  * 2025
  */
 
-#include <stdio.h>
-#include <string.h>
-#include <sys/stat.h>
-
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
-#include "esp_log.h"
-#include "nvs_flash.h"
-
-#include "driver/gpio.h"
-#include "driver/i2s.h"
-#include "driver/spi_master.h"
-#include "driver/sdspi_host.h"
-#include "sdmmc_cmd.h"
-#include "esp_vfs_fat.h"
-#include "esp_check.h"
-#include "freertos/stream_buffer.h"
-
-
-// --- Pins ---
-// SD over SPI (SDSPI on SPI2/HSPI)
-#define SD_CS          5
-#define SPI_MOSI      23
-#define SPI_MISO      19
-#define SPI_SCK       18
-
-// I2S
-#define I2S_DOUT      27
-#define I2S_BCLK      26
-#define I2S_LRC       25
-
-// Trigger input
-#define TRIGGER_GPIO   GPIO_NUM_4
-#define TRIGGER_LEVEL  0             // 0: falling edge, 1: rising edge
-#define DEBOUNCE_MS    50
-
-// Filesystem
-#define MOUNT_POINT   "/sdcard"
-#define AUDIO_BUFFER_MAX_SIZE (44100 * 16 * 30)           // buffer size for reading the wav file and sending to i2s. 44.1K 16-bit samples per second, times 30 seconds
-#define RB_CAPACITY     (96 * 1024)
-#define SD_READ_CHUNK   (8 * 1024)      // bytes per SD read  (multiple of 512)
-#define I2S_WRITE_CHUNK (4 * 1024)      // bytes per I2S write
-
-// Command queue
-#define BIT_PRODUCER_DONE  (1 << 0)
-#define BIT_CONSUMER_DONE  (1 << 1)
-
-static EventGroupHandle_t s_done_group;
-typedef enum { CMD_PLAY, CMD_STOP } player_cmd_t;
-static QueueHandle_t s_cmd_q = NULL;
-static volatile bool s_is_playing = false;
-
+#include "alarm.h"
+#include "filesystem.c"
+#include "bluetooth.c"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 
 typedef struct {
-    size_t s_buffer_size;
-    size_t s_number_of_samples;
-    int s_buffer_sample_rate;
-    FILE* s_file_handle;
-    size_t s_reader_offset;
-    StreamBufferHandle_t s_reader_buffer;
-    bool s_paused;
-} decoded_wav_t;
+    decoded_wav_t* wav;
+    bool destroy_on_finish;
+} playback_cmd_t;
 
 static decoded_wav_t s_decoded_wavs[2];
 
@@ -164,83 +111,34 @@ static esp_err_t sdcard_mount(void)
 //     spi_bus_free(SPI2_HOST);
 // }
 
-static esp_err_t prepare_wav_file(decoded_wav_t* wav_s, const char *filename) {
-    const static char* TAG = "prepare_wav_file";
-    ESP_LOGI(TAG, "Preparing wav file %s", filename);
-    // Setup the stream buffer
-    if (wav_s->s_reader_buffer) vStreamBufferDelete(wav_s->s_reader_buffer);
-    wav_s->s_reader_buffer = xStreamBufferCreate(RB_CAPACITY, 0);
-    if (wav_s->s_reader_buffer == NULL) {
-        ESP_LOGE(TAG, "Failed to create reader buffer");
-        return ESP_FAIL;
-    }
-    // Put the file names together
-    char* full_file_name = malloc(strlen(filename) + strlen(MOUNT_POINT) + 2);
-    strcpy(full_file_name, MOUNT_POINT);
-    strcat(full_file_name, "/");
-    strcat(full_file_name, filename);
-    FILE *fh = fopen(full_file_name, "rb");
-    free(full_file_name);
-    if (fh == NULL)
-    {
-        ESP_LOGE(TAG, "Failed to open file");
-        return ESP_ERR_INVALID_ARG;
-    }
-    wav_s->s_file_handle = fh;
-    // Seek to sample rate
-    fseek(fh, 24, SEEK_SET);
-    // Read sample rate
-    fread(&(wav_s->s_buffer_sample_rate), 4, 1, fh);
-    ESP_LOGI(TAG, "sample rate: %d", wav_s->s_buffer_sample_rate);
-    // Seek to Subchunk2Size
-    fseek(fh, 40, SEEK_SET);
-    // Read subchunk (audio data) size
-    size_t data_byte_size;
-    fread(&data_byte_size, 4, 1, fh);
-    // This is NOT the number of samples
-    // This is the number of bytes of the entire data area!!
-    // == NumSamples * NumChannels * BitsPerSample/8
-    // Since we know NumChannels and BitsPerSample, it is possible to calculate NumSamples
 
-    wav_s->s_number_of_samples = data_byte_size / 1 / (16/8);
-    wav_s->s_buffer_size = data_byte_size;
-    ESP_LOGI(TAG, "buffer size: %d", wav_s->s_buffer_size);
-
-    // Seek to data
-    fseek(fh, 44, SEEK_SET);
-
-    // Begin prefilling the buffer
-    {
-        uint8_t* pre = heap_caps_malloc(SD_READ_CHUNK, MALLOC_CAP_DMA);
-        wav_s->s_reader_offset = 0;
-        while (wav_s->s_reader_offset < (RB_CAPACITY)) {
-            size_t n = fread(pre, 1, SD_READ_CHUNK, fh);
-            if (n == 0) break;
-            size_t sent = 0;
-            while (sent < n) {
-                sent += xStreamBufferSend(wav_s->s_reader_buffer, pre + sent, n - sent, portMAX_DELAY);
-            }
-            wav_s->s_reader_offset += n;
-        }
-        vPortFree(pre);
-    }
-
-    ESP_LOGI(TAG, "WAV file loaded. Leaving the following struct behind:");
-    ESP_LOGI(TAG, "Sample rate: %d", wav_s->s_buffer_sample_rate);
-    ESP_LOGI(TAG, "Buffer size: %d", wav_s->s_buffer_size);
-    ESP_LOGI(TAG, "Number of samples: %d", wav_s->s_number_of_samples);
-    return ESP_OK;
+int randrange(int min, int max){
+    return min + esp_random() / (UINT32_MAX / (max - min + 1) + 1);
 }
+
+char* name_from_rarity(file_rarity_t rarity) {
+    switch (rarity) {
+        case ANY: return "ANY"; break;
+        case COMMON: return "COMMON"; break;
+        case UNCOMMON: return "UNCOMMON"; break;
+        case RARE: return "RARE"; break;
+        case LEGENDARY: return "LEGENDARY"; break;
+    }
+    return NULL;
+}
+
+
 
 // ---------------- WAV playback (task context) ----------------
 static void consumer_i2s_task(void* arg) {
     const static char* TAG = "consumer_i2s_task";
-    decoded_wav_t* wav_s = (decoded_wav_t*)arg;
-    uint8_t* chunk = heap_caps_malloc(I2S_WRITE_CHUNK, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    i2s_init(wav_s->s_buffer_sample_rate, 1);
+    playback_cmd_t* cmd = (playback_cmd_t*)arg;
+    decoded_wav_t* wav_s = cmd->wav;
+    uint8_t* chunk = heap_caps_malloc(I2S_WRITE_CHUNK, MALLOC_CAP_DMA);
+    i2s_update_rate_channels(wav_s->s_buffer_sample_rate, 1);
     for (;;) {
         // Wait until at least one byte is available, then read up to chunk size
-        size_t got = xStreamBufferReceive(wav_s->s_reader_buffer, chunk, I2S_WRITE_CHUNK, pdMS_TO_TICKS(2000));
+        size_t got = xStreamBufferReceive(wav_s->s_reader_buffer, chunk, I2S_WRITE_CHUNK, pdMS_TO_TICKS(1000));
         if (got < I2S_WRITE_CHUNK) {
             ESP_LOGW(TAG, "Received %d bytes, less than chunk size!!", got);
         }
@@ -260,15 +158,15 @@ static void consumer_i2s_task(void* arg) {
             }
         }
     }
-    vPortFree(chunk);
-    i2s_driver_uninstall(I2S_NUM_0);
+    heap_caps_free(chunk);
     xEventGroupSetBits(s_done_group, BIT_CONSUMER_DONE);
     vTaskDelete(NULL);
 }
 
 static void producer_task(void* arg) {
     const static char* TAG = "producer_task";
-    decoded_wav_t* wav_s = (decoded_wav_t*)arg;
+    const playback_cmd_t* cmd = (playback_cmd_t*)arg;
+    decoded_wav_t* wav_s = cmd->wav;
     uint8_t* tmp = heap_caps_malloc(SD_READ_CHUNK, MALLOC_CAP_DMA);
     size_t got = 0;
     for (;;) {
@@ -283,8 +181,16 @@ static void producer_task(void* arg) {
         }
     }
     // Signal EOF by closing the stream (writer will detect no more incoming after drain)
-    vPortFree(tmp);
-    fclose(wav_s->s_file_handle);
+    heap_caps_free(tmp);
+    if (cmd->destroy_on_finish) {
+        fclose(wav_s->s_file_handle);
+        wav_s->s_file_handle = NULL;
+    }
+    else {
+        // Reset the file to the beginning of PCM data for the next play instead
+        fseek(wav_s->s_file_handle, 44, SEEK_SET);
+        wav_s->s_reader_offset = 0;
+    }
     xEventGroupSetBits(s_done_group, BIT_PRODUCER_DONE);
     ESP_LOGI(TAG, "Producer done reading file");
     vTaskDelete(NULL);
@@ -328,23 +234,37 @@ static void trigger_gpio_init(void)
 // ---------------- Player task ----------------
 static void player_task(void *arg)
 {
+    char* filename = NULL;
     const static char* TAG = "player_task";
     if (sdcard_mount() != ESP_OK) {
         ESP_LOGE(TAG, "SD mount failed, player task exiting.");
         vTaskDelete(NULL);
         return;
     }
-    prepare_wav_file(&s_decoded_wavs[0], "MYMUSIC.wav");
+
+    // Prepare first file
+    filename = get_random_filename(ANY);
+    prepare_wav_file(&s_decoded_wavs[0], filename);
+    i2s_init(s_decoded_wavs[0].s_buffer_sample_rate, 1);
+    free(filename);
+    filename = NULL;
+
+    // Prepare BLE file
+    prepare_wav_file(&s_decoded_wavs[1], AUDIO_FOLDER "doorbell.wav");
     if (!s_done_group) s_done_group = xEventGroupCreate();
 
-    for (;;) {
+    while (1) {
         player_cmd_t cmd;
         if (xQueueReceive(s_cmd_q, &cmd, portMAX_DELAY) == pdTRUE) {
-            if (cmd == CMD_PLAY) {
+            if (cmd == CMD_PLAY || cmd == CMD_PLAY_DOORBELL) {
+                playback_cmd_t pcmd;
                 ESP_LOGI(TAG, "PLAY command received");
                 if (!s_is_playing) {
-                    xTaskCreatePinnedToCore(producer_task, "sd_reader", 4096, &s_decoded_wavs[0], 5, NULL, 1);
-                    xTaskCreatePinnedToCore(consumer_i2s_task, "i2s_writer", 4096, &s_decoded_wavs[0], 6, NULL, 1);
+                    decoded_wav_t* wav = cmd == CMD_PLAY ? &s_decoded_wavs[0] : &s_decoded_wavs[1];
+                    pcmd.wav = wav;
+                    pcmd.destroy_on_finish = cmd == CMD_PLAY;
+                    xTaskCreatePinnedToCore(producer_task, "sd_reader", 4096, &pcmd, 5, NULL, 1);
+                    xTaskCreatePinnedToCore(consumer_i2s_task, "i2s_writer", 4096, &pcmd, 6, NULL, 1);
 
                     // Wait until BOTH bits are set
                     (void)xEventGroupWaitBits(
@@ -356,7 +276,18 @@ static void player_task(void *arg)
                     );
                     // If we queued more than one play, reset now
                     xQueueReset(s_cmd_q);
-                    prepare_wav_file(&s_decoded_wavs[0], "MYMUSIC.wav");
+                    if (cmd == CMD_PLAY) {
+                        esp_err_t err;
+                        do {
+                            filename = get_random_filename(ANY);
+                            err = prepare_wav_file(&s_decoded_wavs[0], filename);
+                            free(filename);
+                        }
+                        while (err != ESP_OK);
+
+                        filename = NULL;
+                    }
+                    else{ xStreamBufferReset(wav->s_reader_buffer); }
                 }
             }
         }
@@ -365,16 +296,87 @@ static void player_task(void *arg)
 
 }
 
+static void IRAM_ATTR isr_boot(void *arg) {
+    uint32_t v = 1;
+    BaseType_t hpw = pdFALSE;
+    if (!s_pair_window_open)
+        xQueueSendFromISR(s_btnq, &v, &hpw);
+    portYIELD_FROM_ISR();
+}
+
+static void button_task(void *arg) {
+    uint32_t v;
+    for (;;) {
+        if (xQueueReceive(s_btnq, &v, portMAX_DELAY)) {
+            // simple debounce (optional)
+            vTaskDelay(pdMS_TO_TICKS(50));
+            if (gpio_get_level(BOOT_BTN_GPIO) == 0) {
+                open_pair_window();
+            }
+        }
+    }
+}
+
+static void button_init(void) {
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << BOOT_BTN_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,   // BOOT has on-board pull-up
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE      // press -> low
+    };
+    gpio_config(&io);
+    gpio_isr_handler_add(BOOT_BTN_GPIO, isr_boot, NULL);
+
+    s_btnq = xQueueCreate(4, sizeof(uint32_t));
+    xTaskCreatePinnedToCore(button_task, "btn", 8192, NULL, 5, NULL, tskNO_AFFINITY);
+
+    // Timer for closing the window
+    const esp_timer_create_args_t targs = { .callback = &close_pair_window, .name = "pairwin" };
+    esp_timer_create(&targs, &s_pair_timer);
+}
+
 // ---------------- app_main ----------------
 void app_main(void)
 {
-    ESP_ERROR_CHECK(nvs_flash_init());
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        // NVS partition was truncated and needs to be erased
+        // Retry nvs_flash_init
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
 
     s_cmd_q = xQueueCreate(4, sizeof(player_cmd_t));
     configASSERT(s_cmd_q != NULL);
-
     trigger_gpio_init();
 
+    /* Initialize the controller + HCI and the NimBLE host */
+    nimble_port_init();
+    ble_security_init();
+    button_init();
+
+    /* Register GAP/GATT services provided by NimBLE (for Device Name, etc.) */
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+
+    /* Set the device name that appears in scan results */
+    ble_svc_gap_device_name_set(DEVICE_NAME);
+
+    /* Add our own GATT services */
+    int rc = ble_gatts_count_cfg(gatt_svcs);
+    assert(rc == 0);
+    rc = ble_gatts_add_svcs(gatt_svcs);
+    assert(rc == 0);
+
+    /* Start the host; once sync completes, start advertising */
+    ble_hs_cfg.reset_cb = NULL;          /* optional */
+    ble_hs_cfg.sync_cb  = on_sync;       /* called when the stack is ready */
+    ble_hs_cfg.gatts_register_cb = NULL; /* optional debug */
+
+    /* Launch host thread */
+    nimble_port_freertos_init(host_task);
 
 
     xTaskCreatePinnedToCore(player_task, "player_task",

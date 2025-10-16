@@ -113,7 +113,7 @@ static esp_err_t sdcard_mount(void)
 
 
 int randrange(int min, int max){
-    return min + rand() / (RAND_MAX / (max - min + 1) + 1);
+    return min + esp_random() / (RAND_MAX / (max - min + 1) + 1);
 }
 
 char* name_from_rarity(file_rarity_t rarity) {
@@ -345,9 +345,6 @@ void app_main(void)
 
     s_cmd_q = xQueueCreate(4, sizeof(player_cmd_t));
     configASSERT(s_cmd_q != NULL);
-    bootloader_random_enable();
-    srand(esp_random());
-    bootloader_random_disable();
     trigger_gpio_init();
 
     /* Initialize the controller + HCI and the NimBLE host */

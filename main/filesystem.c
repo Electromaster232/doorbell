@@ -50,6 +50,48 @@ int numPlaces (int n) {
     return r;
 }
 
+// ---- Tunable weights ----
+#define WEIGHT_COMMON     60
+#define WEIGHT_UNCOMMON   25
+#define WEIGHT_RARE       12
+#define WEIGHT_LEGENDARY   3
+
+static file_rarity_t pick_weighted_rarity(void) {
+    const int weights[] = {
+        WEIGHT_COMMON,
+        WEIGHT_UNCOMMON,
+        WEIGHT_RARE,
+        WEIGHT_LEGENDARY
+    };
+    const file_rarity_t rarities[] = {
+        COMMON, UNCOMMON, RARE, LEGENDARY
+    };
+
+    int total = 0;
+    for (size_t i = 0; i < sizeof(weights)/sizeof(weights[0]); ++i) {
+        if (weights[i] > 0) total += weights[i];
+    }
+
+    // Defensive: if all weights are zero, fall back to COMMON
+    if (total <= 0) return COMMON;
+
+    // Get a number in [0, total-1] using esp_random (uniform over uint32)
+    uint32_t r = esp_random() % (uint32_t)total;
+
+    // Walk cumulative weights
+    int total_weight = 0;
+    for (size_t i = 0; i < sizeof(weights)/sizeof(weights[0]); ++i) {
+        if (weights[i] <= 0) continue; // skip zero/negative weights
+        total_weight += weights[i];
+        if ((int)r < total_weight) {
+            return rarities[i];
+        }
+    }
+
+    // Fallback
+    return COMMON;
+}
+
 
 
 char* get_random_filename(file_rarity_t rarity) {
@@ -57,7 +99,7 @@ char* get_random_filename(file_rarity_t rarity) {
     // First decide which folder type we want
     // If any, roll random between 0-3
     if (rarity == ANY) {
-        rarity = randrange(0,3);
+        rarity = pick_weighted_rarity();
     }
     ESP_LOGI(TAG, "Rarity: %d", rarity);
     // Get foldername
@@ -68,8 +110,16 @@ char* get_random_filename(file_rarity_t rarity) {
 
 
     uint8_t fileNum = count_files_in_directory(foldername);
+    int selectedFileNum = 0;
+    if (fileNum <= 0) {
+        ESP_LOGE(TAG, "No files in folder!!");
+        free(foldername);
+        return NULL;
+    }
+    if (fileNum > 1) {
+        selectedFileNum = randrange(0, fileNum-1);
+    }
 
-    int selectedFileNum = randrange(0, fileNum-1);
     unsigned int decPlacesInFileNum = numPlaces(selectedFileNum);
     ESP_LOGI(TAG, "Places in file: %d", decPlacesInFileNum);
     size_t fileNameLen = strlen(foldername) + decPlacesInFileNum + 6;
